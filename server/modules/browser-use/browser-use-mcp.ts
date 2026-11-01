@@ -20,7 +20,40 @@ const textResponse = (text: string) => ({
   content: [{ type: 'text', text }],
 });
 
-const jsonResponse = (value: unknown) => textResponse(JSON.stringify(value, null, 2));
+
+// Screenshots as base64 inside JSON cost ~12k tokens per call; return them as an MCP image block instead.
+const stripScreenshots = (value: unknown, found: string[]): unknown => {
+  if (Array.isArray(value)) {
+    return value.map((item) => stripScreenshots(item, found));
+  }
+  if (value && typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+      if (key === 'screenshotDataUrl') {
+        if (typeof item === 'string') {
+          found.push(item);
+        }
+        continue;
+      }
+      out[key] = stripScreenshots(item, found);
+    }
+    return out;
+  }
+  return value;
+};
+
+const browserResponse = (value: unknown, withImage = true) => {
+  const screenshots: string[] = [];
+  const stripped = stripScreenshots(value, screenshots);
+  const content: Array<Record<string, string>> = [{ type: 'text', text: JSON.stringify(stripped, null, 2) }];
+  const match = withImage && screenshots.length === 1
+    ? /^data:(image\/[a-z+.-]+);base64,(.+)$/s.exec(screenshots[0])
+    : null;
+  if (match) {
+    content.push({ type: 'image', mimeType: match[1], data: match[2] });
+  }
+  return { content };
+};
 
 const readString = (value: unknown, name: string): string => {
   if (typeof value !== 'string' || value.trim() === '') {
@@ -183,6 +216,19 @@ const tools: ToolDefinition[] = [
     },
   },
   {
+    name: 'browser_upload_file',
+    description: 'Attach local files to a file input (defaults to the first input[type=file]). Paths must be absolute files on the CloudCLI host, up to 10 files of 25 MB each.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        sessionId: { type: 'string' },
+        selector: { type: 'string', description: 'CSS selector of the file input. Defaults to input[type="file"].' },
+        paths: { type: 'array', items: { type: 'string' }, description: 'Absolute paths of the files to upload.' },
+      },
+      required: ['sessionId', 'paths'],
+    },
+  },
+  {
     name: 'browser_wait_for',
     description: 'Wait for visible text, a URL pattern, or a short timeout.',
     inputSchema: {
@@ -220,23 +266,23 @@ const tools: ToolDefinition[] = [
 async function callTool(name: string, args: Record<string, unknown>) {
   switch (name) {
     case 'browser_create_session':
-      return jsonResponse(await callBrowserUseApi(name, {
+      return browserResponse(await callBrowserUseApi(name, {
         profileName: readOptionalString(args.profileName),
       }));
     case 'browser_list_sessions':
-      return jsonResponse(await callBrowserUseApi(name, {}));
+      return browserResponse(await callBrowserUseApi(name, {}), false);
     case 'browser_snapshot':
-      return jsonResponse(await callBrowserUseApi(name, { sessionId: readString(args.sessionId, 'sessionId') }));
+      return browserResponse(await callBrowserUseApi(name, { sessionId: readString(args.sessionId, 'sessionId') }));
     case 'browser_take_screenshot': {
-      return jsonResponse(await callBrowserUseApi(name, { sessionId: readString(args.sessionId, 'sessionId') }));
+      return browserResponse(await callBrowserUseApi(name, { sessionId: readString(args.sessionId, 'sessionId') }));
     }
     case 'browser_navigate':
-      return jsonResponse(await callBrowserUseApi(name, {
+      return browserResponse(await callBrowserUseApi(name, {
         sessionId: readString(args.sessionId, 'sessionId'),
         url: readString(args.url, 'url'),
       }));
     case 'browser_click':
-      return jsonResponse(await callBrowserUseApi(name, {
+      return browserResponse(await callBrowserUseApi(name, {
         sessionId: readString(args.sessionId, 'sessionId'),
         selector: readOptionalString(args.selector),
         text: readOptionalString(args.text),
@@ -244,7 +290,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
         y: readNumber(args.y),
       }));
     case 'browser_type':
-      return jsonResponse(await callBrowserUseApi(name, {
+      return browserResponse(await callBrowserUseApi(name, {
         sessionId: readString(args.sessionId, 'sessionId'),
         selector: readOptionalString(args.selector),
         text: readString(args.text, 'text'),
@@ -260,31 +306,37 @@ async function callTool(name: string, args: Record<string, unknown>) {
           };
         })
         : [];
-      return jsonResponse(await callBrowserUseApi(name, {
+      return browserResponse(await callBrowserUseApi(name, {
         sessionId: readString(args.sessionId, 'sessionId'),
         fields,
       }));
     }
     case 'browser_press_key':
-      return jsonResponse(await callBrowserUseApi(name, {
+      return browserResponse(await callBrowserUseApi(name, {
         sessionId: readString(args.sessionId, 'sessionId'),
         key: readString(args.key, 'key'),
       }));
     case 'browser_select_option':
-      return jsonResponse(await callBrowserUseApi(name, {
+      return browserResponse(await callBrowserUseApi(name, {
         sessionId: readString(args.sessionId, 'sessionId'),
         selector: readString(args.selector, 'selector'),
         values: Array.isArray(args.values) ? args.values.filter((value): value is string => typeof value === 'string') : [],
       }));
+    case 'browser_upload_file':
+      return browserResponse(await callBrowserUseApi(name, {
+        sessionId: readString(args.sessionId, 'sessionId'),
+        selector: readOptionalString(args.selector),
+        paths: Array.isArray(args.paths) ? args.paths.filter((value): value is string => typeof value === 'string') : [],
+      }));
     case 'browser_wait_for':
-      return jsonResponse(await callBrowserUseApi(name, {
+      return browserResponse(await callBrowserUseApi(name, {
         sessionId: readString(args.sessionId, 'sessionId'),
         text: readOptionalString(args.text),
         url: readOptionalString(args.url),
         timeoutMs: readNumber(args.timeoutMs),
       }));
     case 'browser_tabs':
-      return jsonResponse(await callBrowserUseApi(name, {
+      return browserResponse(await callBrowserUseApi(name, {
         sessionId: readString(args.sessionId, 'sessionId'),
         action: args.action === 'new' || args.action === 'select' || args.action === 'close' || args.action === 'list'
           ? args.action
@@ -293,7 +345,7 @@ async function callTool(name: string, args: Record<string, unknown>) {
         url: readOptionalString(args.url),
       }));
     case 'browser_close_session':
-      return jsonResponse(await callBrowserUseApi(name, { sessionId: readString(args.sessionId, 'sessionId') }));
+      return browserResponse(await callBrowserUseApi(name, { sessionId: readString(args.sessionId, 'sessionId') }));
     default:
       throw new Error(`Unknown tool: ${name}`);
   }

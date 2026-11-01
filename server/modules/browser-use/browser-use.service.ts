@@ -345,6 +345,43 @@ function normalizeUrl(rawUrl: string): string {
   return parsed.toString();
 }
 
+const MAX_UPLOAD_FILES = 10;
+const MAX_UPLOAD_FILE_BYTES = 25 * 1024 * 1024;
+
+/**
+ * Validates file paths an agent wants to attach to a page's file input.
+ * Only absolute paths to existing regular files within the size cap are accepted, and symlinks are
+ * resolved so the size/type checks apply to the real target.
+ */
+function resolveUploadFiles(rawPaths: string[]): string[] {
+  if (rawPaths.length === 0) {
+    throw new Error('Provide at least one file path.');
+  }
+  if (rawPaths.length > MAX_UPLOAD_FILES) {
+    throw new Error(`At most ${MAX_UPLOAD_FILES} files can be uploaded at once.`);
+  }
+  return rawPaths.map((rawPath) => {
+    if (!path.isAbsolute(rawPath)) {
+      throw new Error(`File path must be absolute: ${rawPath}`);
+    }
+    let realPath: string;
+    let stat: fs.Stats;
+    try {
+      realPath = fs.realpathSync(rawPath);
+      stat = fs.statSync(realPath);
+    } catch {
+      throw new Error(`File not found: ${rawPath}`);
+    }
+    if (!stat.isFile()) {
+      throw new Error(`Not a regular file: ${rawPath}`);
+    }
+    if (stat.size > MAX_UPLOAD_FILE_BYTES) {
+      throw new Error(`File is larger than ${MAX_UPLOAD_FILE_BYTES / (1024 * 1024)} MB: ${rawPath}`);
+    }
+    return realPath;
+  });
+}
+
 function publicSession(session: BrowserUseSession): PublicBrowserUseSession {
   const { ownerId: _ownerId, ...publicFields } = session;
   return publicFields;
@@ -541,9 +578,14 @@ export const browserUseService = {
     let browser: any | undefined;
     let context: any | undefined;
     let page: any;
+    // Hosts without system fontconfig/fonts render no text (empty innerText) and Skia aborts on some pages.
+    const userFontConfig = path.join(os.homedir(), '.config', 'fontconfig', 'fonts.conf');
     const launchOptions = {
       headless: true,
       args: ['--disable-dev-shm-usage'],
+      env: fs.existsSync(userFontConfig) && !fs.existsSync('/etc/fonts/fonts.conf')
+        ? { ...process.env, FONTCONFIG_FILE: userFontConfig }
+        : process.env,
     };
     const contextOptions = {
       viewport: { width: 1440, height: 900 },
@@ -727,6 +769,22 @@ export const browserUseService = {
     return publicSession(session);
   },
 
+  async agentUploadFiles(sessionId: string, input: { selector?: string; paths: string[] }) {
+    // Validate the files first so bad input fails fast, before any session lookup.
+    const files = resolveUploadFiles(input.paths);
+    const session = await this.getAgentSession(sessionId);
+    const handle = handles.get(sessionId);
+    if (!handle?.page) {
+      throw new Error('Browser runtime handle is not available.');
+    }
+    const selector = input.selector || 'input[type="file"]';
+    // setInputFiles works on hidden inputs too, which is how most upload widgets are built.
+    await handle.page.locator(selector).first().setInputFiles(files, { timeout: 10_000 });
+    session.lastAction = `upload_files:${files.length}`;
+    await captureSession(session, handle.page);
+    return { session: publicSession(session), uploaded: files.map((file) => path.basename(file)) };
+  },
+
   async agentWaitFor(sessionId: string, input: { text?: string; url?: string; timeoutMs?: number }) {
     const session = await this.getAgentSession(sessionId);
     const handle = handles.get(sessionId);
@@ -783,6 +841,104 @@ export const browserUseService = {
         url: page.url(),
         active: page === (updatedHandle?.page || handle.page),
       })),
+    };
+  },
+
+  /** Lets the signed-in user drive an agent-owned session (e.g. to complete a login the agent must not handle). */
+  async userInput(
+    sessionId: string,
+    input: { type: 'click'; x: number; y: number; button?: 'left' | 'right' | 'middle'; clickCount?: number }
+      | { type: 'scroll'; x: number; y: number; deltaX: number; deltaY: number }
+      | { type: 'text'; text: string }
+      | { type: 'key'; key: string },
+    options: { refreshScreenshot?: boolean } = {},
+  ) {
+    const session = sessions.get(sessionId);
+    if (!session || session.ownerId !== AGENT_OWNER_ID) {
+      throw new Error('Browser session not found.');
+    }
+    if (session.status !== 'ready') {
+      throw new Error(session.message || 'Browser session is not available.');
+    }
+    const handle = handles.get(sessionId);
+    if (!handle?.page) {
+      throw new Error('Browser runtime handle is not available.');
+    }
+
+    if (input.type === 'click') {
+      await handle.page.mouse.click(input.x, input.y, { button: input.button ?? 'left', clickCount: input.clickCount ?? 1 });
+    } else if (input.type === 'scroll') {
+      await handle.page.mouse.move(input.x, input.y);
+      await handle.page.mouse.wheel(input.deltaX, input.deltaY);
+    } else if (input.type === 'text') {
+      await handle.page.keyboard.insertText(input.text);
+    } else {
+      await handle.page.keyboard.press(input.key);
+    }
+
+    session.lastAction = `user_${input.type}`;
+    session.cursor = null;
+    if (options.refreshScreenshot !== false) {
+      await captureSession(session, handle.page);
+    }
+    return publicSession(session);
+  },
+
+  /** Returns the text currently selected in the page (or in a focused text field) for the panel's copy/cut. */
+  async readSelectedText(sessionId: string): Promise<string> {
+    const session = sessions.get(sessionId);
+    if (!session || session.ownerId !== AGENT_OWNER_ID) {
+      throw new Error('Browser session not found.');
+    }
+    const handle = handles.get(sessionId);
+    if (session.status !== 'ready' || !handle?.page) {
+      throw new Error(session.message || 'Browser session is not available.');
+    }
+    // Evaluated in the page; a string keeps the server build free of DOM typings.
+    const text = await handle.page.evaluate(`(() => {
+      const element = document.activeElement;
+      if (element && typeof element.selectionStart === 'number' && typeof element.selectionEnd === 'number') {
+        // Like a real browser, never hand out the contents of a password field.
+        if (element.type === 'password') {
+          return '';
+        }
+        return element.value.slice(element.selectionStart, element.selectionEnd);
+      }
+      return (window.getSelection() || '').toString();
+    })()`);
+    return typeof text === 'string' ? text : '';
+  },
+
+  /**
+   * Streams the session's page as JPEG frames through Chromium's screencast so the panel can show
+   * it live. Returns a stop function; frames are acknowledged so Chromium keeps producing them.
+   */
+  async startScreencast(
+    sessionId: string,
+    onFrame: (frame: Buffer) => void,
+  ): Promise<() => Promise<void>> {
+    const session = sessions.get(sessionId);
+    if (!session || session.ownerId !== AGENT_OWNER_ID) {
+      throw new Error('Browser session not found.');
+    }
+    if (session.status !== 'ready') {
+      throw new Error(session.message || 'Browser session is not available.');
+    }
+    const handle = handles.get(sessionId);
+    if (!handle?.page || !handle.context) {
+      throw new Error('Browser runtime handle is not available.');
+    }
+
+    const cdp = await handle.context.newCDPSession(handle.page);
+    cdp.on('Page.screencastFrame', (frame: { data: string; sessionId: number }) => {
+      onFrame(Buffer.from(frame.data, 'base64'));
+      void cdp.send('Page.screencastFrameAck', { sessionId: frame.sessionId }).catch(() => undefined);
+    });
+    await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 55, everyNthFrame: 1 });
+
+    return async () => {
+      await cdp.send('Page.stopScreencast').catch(() => undefined);
+      await cdp.detach().catch(() => undefined);
     };
   },
 
